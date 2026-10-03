@@ -1,0 +1,128 @@
+name: qoder-re-analysis
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ghidra:
+    name: Ghidra headless decompile
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Fetch Ghidra release
+        run: |
+          set -e
+          URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | grep -o 'https://[^"]*_PUBLIC_[0-9]*\.zip' | head -1)
+          echo "Ghidra url: $URL"
+          curl -sL -o /tmp/ghidra.zip "$URL"
+          ls -l /tmp/ghidra.zip
+          unzip -q /tmp/ghidra.zip -d /opt
+          GD=$(find /opt -maxdepth 1 -type d -name 'ghidra_*' | head -1)
+          echo "GHIDRA_DIR=$GD" >> "$GITHUB_ENV"
+          chmod +x "$GD/support/analyzeHeadless"
+          "$GD/support/analyzeHeadless" 2>&1 | head -5 || true
+
+      - name: Decompile each binary
+        env:
+          GHIDRA_OUT: ${{ github.workspace }}/out
+          GHIDRA_MAX_FUNCS: '2500'
+        run: |
+          mkdir -p out
+          i=0
+          for f in bin/*; do
+            i=$((i+1))
+            echo "===== ($i) $f"
+            timeout 3000 "$GHIDRA_DIR/support/analyzeHeadless" /tmp/ghproj "p$i" \
+              -import "$f" \
+              -scriptPath "$GITHUB_WORKSPACE/scripts" \
+              -postScript DecompileExport.java \
+              -analysisTimeoutPerFile 1200 \
+              -deleteProject 2>&1 | tail -30 || echo "analyze failed for $f"
+          done
+          ls -l out | head -20
+
+      - name: Dump strings and headers
+        run: |
+          for f in bin/*; do
+            b=$(basename "$f")
+            strings -n 6 "$f" | sort -u > "out/$b.strings.txt" || true
+            objdump -x "$f" > "out/$b.objdump.txt" 2>/dev/null || true
+          done
+          ls -l out | head -30
+
+      - name: Upload ghidra output
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-output
+          path: out
+          retention-days: 30
+
+  jsfmt:
+    name: Format and deobfuscate JS bundles
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Prettify bundles
+        env:
+          NODE_OPTIONS: --max-old-space-size=12288
+        run: |
+          mkdir -p out
+          for f in js/*; do
+            b=$(basename "$f")
+            sz=$(stat -c%s "$f")
+            echo "== $b ($sz bytes)"
+            npx --yes prettier@3 --parser babel --print-width 140 "$f" > "out/$b.pretty.js" 2>"out/$b.prettier.err" || echo "prettier failed: $b"
+          done
+          ls -l out | head -30
+
+      - name: Deobfuscate worker string table
+        run: |
+          cat > /tmp/deobf.py <<'PYEOF'
+          import re, base64, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          data = open(src, 'r', encoding='utf-8', errors='replace').read()
+          calls = re.findall(r'_\$d\("([A-Za-z0-9+/=]{4,400})"\)', data)
+          def dec(s, k='wnWOOEYHZLPw'):
+              b = bytearray(base64.b64decode(s + '=' * (-len(s) % 4)))
+              for i in range(len(b)):
+                  b[i] ^= ord(k[i % len(k)])
+              try:
+                  return b.decode('utf-8')
+              except Exception:
+                  return None
+          seen = set()
+          for c in calls:
+              v = dec(c)
+              if v:
+                  seen.add(v)
+          open(dst, 'w', encoding='utf-8').write('\n'.join(sorted(seen)))
+          print('decrypted strings:', len(seen))
+          PYEOF
+          for f in js/qoder-worker-runtime.obf.mjs; do
+            [ -f "$f" ] && python3 /tmp/deobf.py "$f" "out/qoder-worker-runtime.strings.txt" || true
+          done
+          wc -l out/*.strings.txt 2>/dev/null || true
+
+      - name: Upload js output
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-output
+          path: out
+          retention-days: 30
