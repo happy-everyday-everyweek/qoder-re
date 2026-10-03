@@ -38,7 +38,7 @@ jobs:
           GHIDRA_OUT: ${{ github.workspace }}/out
           GHIDRA_MAX_FUNCS: '2500'
         run: |
-          mkdir -p out
+          mkdir -p out /tmp/ghproj
           i=0
           for f in bin/*; do
             i=$((i+1))
